@@ -561,7 +561,7 @@ class GroupChatClient:
         self.send_to_server('BROADCAST', broadcast_data)
 
     def TUI(self):
-        print("*************** Peer Group Chat ***************")
+        print("\n*************** Peer Group Chat ***************\n")
         print("Wahlen Sie eine Aktion:")
         print(" 1                       - Benutzer auflisten")
         print(" 2 <Name>                - Chat mit Benutzer starten")
