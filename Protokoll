@@ -1,0 +1,189 @@
+Client (Header-Based Protocol für P2P)
+
+Protokollstruktur:                 |     Beispiel-Nachricht:
+-----------------------------------|---------------------------------------------------
+MESSAGE_TYPE PROTOCOL_VERSION      |     REGISTER 1.0\r\n               <- Pflicht
+Header-Key: Header-Value           |     Host: 192.168.1.100\r\n
+Header-Key: Header-Value           |     Content-Length: 67\r\n         <- Pflicht
+...                                |     \r\n\r\n
+[Leerzeile]                        |     {"nickname": "Laurin", "ip": "192.168.1.100", "udp_port": 12345}
+[JSON-BODY]
+
+MESSAGE_TYPE Client->Server: REGISTER, UNREGISTER, BROADCAST
+MESSAGE_TYPE Server->Client: REGISTER_OK, USER_LIST, USER_JOINED, USER_LEFT, BROADCAST_MSG, BROADCAST_OK, ERROR
+MESSAGE_TYPE Peer-to-Peer UDP: CHAT_REQUEST, CHAT_RESPONSE
+MESSAGE_TYPE Peer-to-Peer TCP: CHAT_HELLO, CHAT_MSG, CHAT_CLOSE
+
+HEADER-KEY: Host, From, To, Request-ID, Content-Length, Timestamp
+
+
+# === common.py ===
+class ClientInfo:
+    def __init__(self, nickname="", ip="", udp_port=0):
+        self.nickname = nickname
+        self.my_ip = ip
+        self.udp_port = udp_port
+        self.server_socket = None
+        self.udp_socket = None
+        self.tcp_chat_socket = None
+        self.tcp_port = 0
+        self.peer_list = {}       # {nickname: {ip, udp_port}}
+        self.active_chats = {}    # {nickname: socket}
+        self.running = False
+
+    def __str__(self):
+        return f"{self.nickname} ({self.my_ip}:{self.udp_port})"
+
+    def to_message(self):
+        return f"NEW {self.nickname} {self.my_ip} {self.udp_port}"
+
+    @staticmethod
+    def from_message(msg):
+        _, nickname, ip, port = msg.split()
+        return ClientInfo(nickname, ip, int(port))
+
+
+# === Client.py (angepasst) ===
+import socket
+import threading
+import json
+import time
+import random
+from typing import Dict, List
+from common import ClientInfo
+
+class GroupChatClient:
+    PROTOCOL_VERSION = "1.0"
+
+    def __init__(self):
+        self.info = ClientInfo()
+
+    def start(self, server_host='localhost', server_port=8888):
+        try:
+            self.info.nickname = input("Nickname eingeben: ").strip()
+            if not self.info.nickname:
+                print("Ungültiger Nickname")
+                return
+
+            self.setup_udp_socket()
+            self.setup_tcp_chat_socket()
+            self.connect_to_server(server_host, server_port)
+            self.register_with_server()
+
+            self.info.running = True
+
+            threading.Thread(target=self.handle_server_messages, daemon=True).start()
+            threading.Thread(target=self.handle_udp_messages, daemon=True).start()
+            threading.Thread(target=self.tcp_chat_server, daemon=True).start()
+
+            self.TUI()
+
+        except Exception as e:
+            print(f"Client-Fehler: {e}")
+        finally:
+            self.stop()
+
+    def setup_udp_socket(self):
+        self.info.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.info.udp_socket.bind(('', 0))
+        self.info.udp_port = self.info.udp_socket.getsockname()[1]
+        print(f"UDP Socket auf Port {self.info.udp_port}")
+
+    def setup_tcp_chat_socket(self):
+        self.info.tcp_chat_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.info.tcp_chat_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.info.tcp_chat_socket.bind(('', 0))
+        self.info.tcp_port = self.info.tcp_chat_socket.getsockname()[1]
+        self.info.tcp_chat_socket.listen(5)
+        print(f"TCP Chat Socket auf Port {self.info.tcp_port}")
+
+    def connect_to_server(self, host, port):
+        self.info.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.info.server_socket.connect((host, port))
+        self.info.my_ip = self.info.server_socket.getsockname()[0]
+        print(f"Mit Server verbunden: {host}:{port}")
+
+    def register_with_server(self):
+        register_data = {
+            'nickname': self.info.nickname,
+            'ip': self.info.my_ip,
+            'udp_port': self.info.udp_port
+        }
+        self.send_to_server('REGISTER', register_data)
+
+    def send_to_server(self, message_type, json_data=None, additional_headers=None):
+        try:
+            body = json.dumps(json_data) if json_data else ""
+            headers = [
+                f"{message_type} {self.PROTOCOL_VERSION}",
+                f"Host: {self.info.my_ip}",
+                f"Content-Length: {len(body.encode('utf-8'))}"
+            ]
+            if additional_headers:
+                for key, value in additional_headers.items():
+                    headers.append(f"{key}: {value}")
+            message = "\r\n".join(headers) + "\r\n\r\n" + body
+            self.info.server_socket.send(message.encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Fehler beim Senden an Server: {e}")
+            return False
+
+    def stop(self):
+        self.info.running = False
+        for socket_obj in [self.info.server_socket, self.info.udp_socket, self.info.tcp_chat_socket]:
+            if socket_obj:
+                try:
+                    socket_obj.close()
+                except:
+                    pass
+        print("Client beendet")
+
+
+# === Server.py (angepasst) ===
+import socket
+import threading
+import json
+import time
+from common import ClientInfo
+
+class GroupChatServer:
+    PROTOCOL_VERSION = "1.0"
+
+    def __init__(self, host='localhost', port=8888):
+        self.host = host
+        self.port = port
+        self.clients = {}  # {client_socket: ClientInfo}
+        self.server_socket = None
+        self.running = False
+
+    def handle_register(self, client_socket, headers, json_data):
+        try:
+            nickname = json_data.get('nickname')
+            ip = headers.get('Host', json_data.get('ip'))
+            udp_port = json_data.get('udp_port')
+
+            if not nickname or not ip or not udp_port:
+                self.send_error(client_socket, "Missing required fields")
+                return
+
+            if any(info.nickname == nickname for info in self.clients.values()):
+                self.send_error(client_socket, "Nickname already exists")
+                return
+
+            client_info = ClientInfo(nickname, ip, udp_port)
+            client_info.server_socket = client_socket
+
+            self.clients[client_socket] = client_info
+
+            response_data = {'message': f'Successfully registered as {nickname}'}
+            self.send_message(client_socket, 'REGISTER_OK', response_data)
+            self.send_user_list(client_socket)
+
+            self.broadcast_user_update('USER_JOINED', nickname, ip, udp_port, exclude=client_socket)
+            print(f"Client {nickname} registriert von {ip}:{udp_port}")
+
+        except Exception as e:
+            self.send_error(client_socket, f"Registration failed: {e}")
+
+    # ... restliche Methoden wie zuvor, Zugriff über client_info.nickname etc. anpassen
